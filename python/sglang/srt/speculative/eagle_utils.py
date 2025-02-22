@@ -13,14 +13,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.build_eagle_tree import (
-    build_tree_kernel,
-    build_tree_kernel_efficient,
-)
+from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.utils import is_cuda_available
 
 if is_cuda_available():
-    from sgl_kernel import tree_speculative_sampling_target_only
+    from sgl_kernel import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -73,18 +74,11 @@ class EagleDraftInput:
         seq_lens_cpu = batch.seq_lens.tolist()
         assert len(batch.req_pool_indices) == len(batch.reqs)
 
-        pt = 0
-        i = 0
         self.keep_indices = []
         for idx, req in enumerate(batch.reqs):
             if req.finished():
                 continue
             self.keep_indices.append(idx)
-            # assert seq_len - pre_len == req.extend_input_len
-            input_len = batch.extend_lens[i]
-            seq_len = seq_lens_cpu[i]
-            pt += input_len
-            i += 1
 
         self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
         new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
@@ -200,67 +194,38 @@ class EagleVerifyInput:
         topk: int,
         spec_steps: int,
         num_verify_tokens: int,
-        is_all_greedy: bool,
     ):
-        if is_all_greedy:
-            tree_mask, position, retrive_index, retrive_cum_len, draft_tokens = (
-                build_tree_kernel(
-                    verified_id,
-                    score_list,  # b, n, topk; n= 1 + (num_steps-1) * self.topk
-                    token_list,
-                    parents_list,
-                    seq_lens,
-                    seq_lens_sum,
-                    topk,
-                    spec_steps,
-                    num_verify_tokens,
-                )
-            )
+        (
+            tree_mask,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            verified_id,
+            score_list,
+            token_list,
+            parents_list,
+            seq_lens,
+            seq_lens_sum,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+        )
 
-            return cls(
-                draft_tokens,
-                tree_mask,
-                position,
-                retrive_index,
-                None,
-                None,
-                retrive_cum_len,
-                num_verify_tokens,
-                spec_steps,
-                CaptureHiddenMode.FULL,
-            )
-        else:
-            (
-                tree_mask,
-                position,
-                retrive_index,
-                retrive_next_token,
-                retrive_next_sibling,
-                draft_tokens,
-            ) = build_tree_kernel_efficient(
-                verified_id,
-                score_list,
-                token_list,
-                parents_list,
-                seq_lens,
-                seq_lens_sum,
-                topk,
-                spec_steps,
-                num_verify_tokens,
-            )
-
-            return cls(
-                draft_tokens,
-                tree_mask,
-                position,
-                retrive_index,
-                retrive_next_token,
-                retrive_next_sibling,
-                None,
-                num_verify_tokens,
-                spec_steps,
-                CaptureHiddenMode.FULL,
-            )
+        return cls(
+            draft_tokens,
+            tree_mask,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            None,
+            num_verify_tokens,
+            spec_steps,
+            CaptureHiddenMode.FULL,
+        )
 
     def prepare_for_verify(self, batch: ScheduleBatch):
         batch.input_ids = self.draft_token
@@ -336,66 +301,54 @@ class EagleVerifyInput:
             dim=-1,
         )
         candidates = draft_token[self.retrive_index]
-        if batch.sampling_info.is_all_greedy:
-            # temp == 0
-            bs = self.retrive_cum_len.numel() - 1
-            predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            predict = torch.cat(
-                [predict, torch.full([1], -1, dtype=torch.int32, device="cuda")], dim=-1
-            )
-            target_predict = predict[self.retrive_index]
-            # logits = logits_output.next_token_logits[self.retrive_index]
-            # target_predict = torch.argmax(logits[:, :-1], dim=-1)
-            accept_mask = candidates[:, 1:] == target_predict[:, :-1]
 
-            accept_mask = (torch.cumprod(accept_mask, dim=1)).sum(dim=1)
-            max_draft_len = self.retrive_index.shape[-1]
-            accept_index = torch.full(
-                (bs, max_draft_len), -1, dtype=torch.int32, device="cuda"
-            )
-            accept_length = torch.empty((bs,), dtype=torch.int, device="cuda")
-            extract_index = torch.full((bs * 2,), 0, dtype=torch.int, device="cuda")
-            eagle_verify_retrive[(bs,)](
-                self.retrive_index.contiguous(),
-                accept_mask.contiguous(),
-                self.retrive_cum_len,
-                accept_index,
-                accept_length,
-                extract_index,
-                max_draft_len,
-                self.draft_token_num,
-                triton.next_power_of_2(max_draft_len),
-            )
-        else:
-            # temp > 0
-            bs = self.retrive_index.shape[0]
-            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-            predict_shape[-1] += 1
-            target_logits = logits_output.next_token_logits[self.retrive_index]
-            predict = torch.full(predict_shape, -1, dtype=torch.int32, device="cuda")
-            accept_index = torch.full(
-                (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
-            )
-            accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
-            expanded_temperature = batch.sampling_info.temperatures.unsqueeze(1)
-            target_probs = F.softmax(target_logits / expanded_temperature, dim=-1)
-            draft_probs = torch.full_like(
-                target_probs, 0, dtype=torch.float32, device="cuda"
-            )
-            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
-            tree_speculative_sampling_target_only(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
-                uniform_samples=coins,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                deterministic=True,
-            )
+        bs = self.retrive_index.shape[0]
+        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+        predict_shape[-1] += 1
+        predict = torch.full(predict_shape, -1, dtype=torch.int32, device="cuda")
+        accept_index = torch.full(
+            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        )
+        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+
+        # apply temperature and get target probs
+        expanded_temperature = torch.repeat_interleave(
+            batch.sampling_info.temperatures, self.draft_token_num, dim=0
+        )  # (bs * draft_token_num, 1)
+        target_probs = F.softmax(
+            logits_output.next_token_logits / expanded_temperature, dim=-1
+        )  # (bs * draft_token_num, vocab_size)
+        expanded_top_ks = torch.repeat_interleave(
+            batch.sampling_info.top_ks, self.draft_token_num, dim=0
+        )  # (bs * draft_token_num)
+        expanded_top_ps = torch.repeat_interleave(
+            batch.sampling_info.top_ps, self.draft_token_num, dim=0
+        )  # (bs * draft_token_num)
+        target_probs = top_k_renorm_prob(
+            target_probs, expanded_top_ks
+        )  # (bs * draft_token_num, vocab_size)
+        target_probs = top_p_renorm_prob(target_probs, expanded_top_ps)
+        target_probs = target_probs[
+            self.retrive_index
+        ]  # (bs, num_draft_token, vocab_size)
+
+        draft_probs = torch.full_like(
+            target_probs, 0, dtype=torch.float32, device="cuda"
+        )
+        coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
+        tree_speculative_sampling_target_only(
+            predicts=predict,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_length,  # mutable
+            candidates=candidates.to(torch.int32),
+            retrive_index=self.retrive_index.to(torch.int32),
+            retrive_next_token=self.retrive_next_token.to(torch.int32),
+            retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
+            uniform_samples=coins,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            deterministic=True,
+        )
 
         new_accept_index = []
         unfinished_index = []
@@ -467,77 +420,6 @@ class EagleVerifyInput:
             accept_length_per_req_cpu=accept_length_cpu,
             accepeted_indices_cpu=accept_index,
         )
-
-
-@triton.jit
-def eagle_verify_retrive(
-    retrive_index,
-    accept_mask,
-    retrive_cum_len,
-    accept_index,
-    accept_length,
-    extract_index,
-    max_len: tl.constexpr,
-    draft_token_num: tl.constexpr,
-    max_len_upper: tl.constexpr,
-):
-    """
-    Args:
-        retrive_index: Pointer to indices of draft tokens
-        accept_mask: Mask indicating which tokens were accepted
-        retrive_cum_len: Cumulative lengths of token sequences in a batch
-        accept_index (out): Accept token indices
-        accept_length (out): Length of accepted tokens per sequence in a batch
-        extract_index (out): Index for last accepted tokens
-        max_len: Maximum length in a batch
-        draft_token_num: Number of tokens speculatively generated
-        max_len_upper An upper bound for token sequence length
-    """
-    pid = tl.program_id(axis=0)
-
-    retrive_end = tl.load(retrive_cum_len + pid + 1)
-    retrive_start = tl.load(retrive_cum_len + pid)
-    retrive_len = retrive_end - retrive_start
-    accept_ptr = accept_mask + retrive_start
-    accept_offset = tl.arange(0, draft_token_num)
-    accept_load_mask = accept_offset < retrive_len
-    accept_len_list = tl.load(
-        accept_ptr + accept_offset, mask=accept_load_mask, other=-1
-    )
-
-    accept_len = tl.max(accept_len_list)
-    max_index = tl.argmax(accept_len_list, axis=0, tie_break_left=True)
-    # triton is not support argmax with tie_break_right, so I need implement it by some way
-    mask_max = accept_len_list == accept_len
-
-    count_mask = tl.full(shape=[draft_token_num], value=0, dtype=tl.int32)
-    count = tl.sum(tl.where(mask_max, 1, count_mask))
-    if count > 1:
-        index = tl.arange(0, draft_token_num)
-        mask_left = index != max_index
-        remained_index = tl.where(mask_max and mask_left, index, 0)
-        max_index = tl.max(remained_index)
-
-    tl.store(accept_length + pid, accept_len)
-    retrive_index_ptr = retrive_index + (retrive_start + max_index) * max_len
-    retrive_offset = tl.arange(0, max_len_upper)
-    retrive_load_mask = retrive_offset < accept_len + 1
-    data = tl.load(retrive_index_ptr + retrive_offset, mask=retrive_load_mask)
-
-    tl.store(
-        accept_index + pid * max_len + retrive_offset, data, mask=retrive_load_mask
-    )
-
-    extract_load_ptr = accept_index + pid * max_len + accept_len
-    if accept_len == max_len - 1:
-        extract_data = tl.load(extract_load_ptr - 1)
-        tl.store(extract_index + pid * 2, extract_data)
-        extract_data = tl.load(extract_load_ptr)
-        tl.store(extract_index + pid * 2 + 1, extract_data)
-
-    else:
-        extract_data = tl.load(extract_load_ptr)
-        tl.store(extract_index + pid * 2, extract_data)
 
 
 @triton.jit
