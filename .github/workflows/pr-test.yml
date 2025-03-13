@@ -337,12 +337,28 @@ jobs:
           python3 test_moe_eval_accuracy_large.py
 
   finish:
+    if: always()
     needs: [
       unit-test-frontend, unit-test-backend-1-gpu, unit-test-backend-2-gpu,
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]
-    runs-on: ubuntu-latest
     steps:
-      - name: Finish
-        run: echo "This is an empty step to ensure that all jobs are completed."
+    runs-on: ubuntu-latest
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          has_failure=false
+          for result in "${results[@]}"; do
+            if [ "$result" != "success" ]; then
+              echo "Found non-successful job with result: $result"
+              has_failure=true
+            fi
+          done
+          if [ "$has_failure" = true ]; then
+            echo "One or more required jobs failed"
+            exit 1
+          else
+            echo "All required jobs completed successfully"
+            exit 0
+          fi
