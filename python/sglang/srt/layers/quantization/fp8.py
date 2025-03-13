@@ -51,9 +51,9 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 is_hip_ = is_hip()
 
-if is_hip_:
-    from aiter.fused_moe_bf16_asm import asm_moe
-    from aiter.ops.shuffle import shuffle_weight
+# if is_hip_:
+#     from aiter.fused_moe_bf16_asm import asm_moe
+#     from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 

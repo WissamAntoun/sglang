@@ -29,8 +29,8 @@ import logging
 
 is_hip_ = is_hip()
 
-if is_hip_:
-    from aiter import ck_moe
+# if is_hip_:
+#     from aiter import ck_moe
 
 logger = logging.getLogger(__name__)
 

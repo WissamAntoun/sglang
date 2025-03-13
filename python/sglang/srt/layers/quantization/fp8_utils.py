@@ -11,8 +11,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 is_hip_ = is_hip()
-if is_hip_ and get_bool_env_var("CK_MOE"):
-    from aiter import gemm_a8w8_blockscale
+# if is_hip_ and get_bool_env_var("CK_MOE"):
+#     from aiter import gemm_a8w8_blockscale
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 if _is_cuda:
