@@ -343,8 +343,8 @@ jobs:
       performance-test-1-gpu-part-1, performance-test-1-gpu-part-2, performance-test-2-gpu,
       accuracy-test-1-gpu, accuracy-test-2-gpu
     ]
-    steps:
     runs-on: ubuntu-latest
+    steps:
       - name: Check all dependent job statuses
         run: |
           results=(${{ join(needs.*.result, ' ') }})
